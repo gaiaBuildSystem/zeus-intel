@@ -33,9 +33,9 @@
     // internet connectivity.
     .dependencies = .{
         .tui = .{
-            .path = "../../../../tmp/tui.zig",
-            // .url = "git+https://github.com/gaiaBuildSystem/tui.zig.git#a13eed9b01c30fe9d31e3577f5e33bb50eef678d",
-            // .hash = "tui-0.0.1-TMwxp-tWBgBwZqdkgqHn4c_YDJSUQhha2-OKOFBGYig3",
+            // .path = "../../../../tmp/tui.zig",
+            .url = "git+https://github.com/gaiaBuildSystem/tui.zig.git#cf10f6f7ec82999b5b38f3f1c4fdb4f319781df9",
+            .hash = "tui-0.0.1-TMwxp-tWBgBwZqdkgqHn4c_YDJSUQhha2-OKOFBGYig3",
         },
     },
     .paths = .{

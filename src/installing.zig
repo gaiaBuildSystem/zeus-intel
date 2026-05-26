@@ -154,6 +154,15 @@ fn doInstall(state: *State) !void {
         }
     }
 
+    // if we reach here, the copy succeeded
+    // use the system command to run fw_setenv zeus_install 0
+    var argv = [_][]const u8{ "fw_setenv", "zeus_install", "0" };
+    var child = std.process.Child.init(
+        &argv,
+        std.heap.page_allocator
+    );
+    _ = try child.spawnAndWait();
+
     // Flush writes to the block device before closing.
     _ = linux.syscall1(.fsync, @as(usize, @intCast(dst_fd)));
 }

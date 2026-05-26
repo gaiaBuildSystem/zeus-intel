@@ -1,0 +1,29 @@
+services:
+  zig-sdk-run-amd64:
+    environment:
+      # id -u
+      - USID=${USID}
+      # id -g
+      - GUSID=${GUSID}
+    volumes:
+      - type: bind
+        source: ${PWD}
+        target: /source
+    platform: linux/amd64
+    image: pergamos/zig-sdk:0.16.0
+    command: tail -f /dev/null
+
+
+  zig-sdk-run-arm64:
+    environment:
+      # id -u
+      - USID=${USID}
+      # id -g
+      - GUSID=${GUSID}
+    volumes:
+      - type: bind
+        source: ${PWD}
+        target: /source
+    platform: linux/arm64
+    image: pergamos/zig-sdk:0.16.0
+    command: tail -f /dev/null

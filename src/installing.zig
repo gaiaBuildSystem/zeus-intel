@@ -6,6 +6,7 @@ const State = @import("state.zig").State;
 // _IOR(0x12, 114, u64) on x86 Linux
 const BLKGETSIZE64: u32 = 0x80081272;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const SECTOR_SIZE: u64 = 512;
 
 pub fn handleEvent(_: *State, _: tui.Event) tui.EventResult {
     return .ignored;
@@ -100,6 +101,70 @@ fn parentBlockDevice(partition_path: []const u8, buf: []u8) ![]const u8 {
     return buf[0..n];
 }
 
+/// Returns how many bytes to copy: sector 0 through the end of the last
+/// defined partition (plus the GPT backup header when applicable).
+/// Falls back to the full device size on any parse error.
+fn diskCopyLimit(fd: i32, device_bytes: u64) u64 {
+    return partitionedSize(fd) catch device_bytes;
+}
+
+fn partitionedSize(fd: i32) !u64 {
+    var mbr: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &mbr, 512, 0))) != 512)
+        return error.ReadFailed;
+    if (mbr[510] != 0x55 or mbr[511] != 0xAA)
+        return error.NoMBRSignature;
+
+    // Check for GPT protective MBR: type 0xEE in first entry, or "EFI PART" at LBA 1.
+    var gpt_hdr: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &gpt_hdr, 512, 512))) == 512 and
+        std.mem.eql(u8, gpt_hdr[0..8], "EFI PART"))
+    {
+        return gptCopyLimit(fd, &gpt_hdr);
+    }
+
+    return mbrCopyLimit(&mbr);
+}
+
+fn mbrCopyLimit(mbr: *const [512]u8) !u64 {
+    var last_lba: u64 = 0;
+    for (0..4) |i| {
+        const e = mbr[446 + i * 16 ..][0..16];
+        if (e[4] == 0) continue; // empty entry
+        const start = std.mem.readInt(u32, e[8..12], .little);
+        const count = std.mem.readInt(u32, e[12..16], .little);
+        if (count == 0) continue;
+        const end = @as(u64, start) + @as(u64, count) - 1;
+        if (end > last_lba) last_lba = end;
+    }
+    if (last_lba == 0) return error.NoPartitions;
+    return (last_lba + 1) * SECTOR_SIZE;
+}
+
+fn gptCopyLimit(fd: i32, hdr: *const [512]u8) !u64 {
+    const alt_lba = std.mem.readInt(u64, hdr[32..40], .little);
+    const entry_lba = std.mem.readInt(u64, hdr[72..80], .little);
+    const num_entries = std.mem.readInt(u32, hdr[80..84], .little);
+    const entry_size = std.mem.readInt(u32, hdr[84..88], .little);
+    if (entry_size < 128 or entry_size > 512) return error.BadEntrySize;
+
+    const capped = @min(num_entries, 4096);
+    var last_lba: u64 = 0;
+    for (0..capped) |i| {
+        var entry: [512]u8 = undefined;
+        const off = entry_lba * SECTOR_SIZE + @as(u64, i) * entry_size;
+        if (@as(isize, @bitCast(linux.pread(fd, &entry, entry_size, @intCast(off)))) != @as(isize, @intCast(entry_size)))
+            continue;
+        if (std.mem.allEqual(u8, entry[0..16], 0)) continue; // empty GUID = unused
+        const end_lba = std.mem.readInt(u64, entry[40..48], .little);
+        if (end_lba > last_lba) last_lba = end_lba;
+    }
+    if (last_lba == 0) return error.NoPartitions;
+    // alt_lba is the backup GPT header; must be included for a bootable copy.
+    const final_lba = @max(last_lba, alt_lba);
+    return (final_lba + 1) * SECTOR_SIZE;
+}
+
 pub fn runInstall(state: *State, complete: *std.atomic.Value(bool)) void {
     defer complete.store(true, .release);
     doInstall(state) catch {};
@@ -131,12 +196,16 @@ fn doInstall(state: *State) !void {
     var total_bytes: u64 = 0;
     _ = linux.ioctl(src_fd, BLKGETSIZE64, @intFromPtr(&total_bytes));
 
+    const copy_limit = diskCopyLimit(src_fd, total_bytes);
+
     const buf = try std.heap.page_allocator.alloc(u8, CHUNK_SIZE);
     defer std.heap.page_allocator.free(buf);
 
     var bytes_done: u64 = 0;
-    while (true) {
-        const nr = linux.read(src_fd, buf.ptr, buf.len);
+    while (bytes_done < copy_limit) {
+        const remaining = copy_limit - bytes_done;
+        const want = @min(buf.len, remaining);
+        const nr = linux.read(src_fd, buf.ptr, want);
         if (@as(isize, @bitCast(nr)) <= 0) break;
         const nread: usize = @intCast(nr);
 
@@ -148,10 +217,8 @@ fn doInstall(state: *State) !void {
         }
 
         bytes_done += nread;
-        if (total_bytes > 0) {
-            const millis: u32 = @intCast(@min(999, bytes_done * 1000 / total_bytes));
-            state.progress.store(millis, .release);
-        }
+        const millis: u32 = @intCast(@min(999, bytes_done * 1000 / copy_limit));
+        state.progress.store(millis, .release);
     }
 
     // if we reach here, the copy succeeded

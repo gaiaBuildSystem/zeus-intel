@@ -295,6 +295,15 @@ pub fn runInstall(state: *State, complete: *std.atomic.Value(bool)) void {
     state.progress.store(1000, .release);
 }
 
+fn ubootEnvSet(name: []const u8, value: []const u8) !void {
+    var argv = [_][]const u8{ "fw_setenv", name, value };
+    var child = std.process.Child.init(
+        &argv,
+        std.heap.page_allocator
+    );
+    _ = try child.spawnAndWait();
+}
+
 fn doInstall(state: *State) !void {
     var parent_buf: [64]u8 = undefined;
     const src_name = try sourceDisk(&parent_buf);
@@ -337,12 +346,8 @@ fn doInstall(state: *State) !void {
     defer std.heap.page_allocator.free(buf);
 
     // the copy need to be done with the zeus_install flag set to 0
-    var argv = [_][]const u8{ "fw_setenv", "zeus_install", "0" };
-    var child = std.process.Child.init(
-        &argv,
-        std.heap.page_allocator
-    );
-    _ = try child.spawnAndWait();
+    try ubootEnvSet("zeus_install", "0");
+    try ubootEnvSet("label_name", "BOOT");
 
     try replaceFstabLabel(std.heap.page_allocator, "BOOT-INTEL", "BOOT");
 
@@ -398,12 +403,8 @@ fn doInstall(state: *State) !void {
     try replaceFstabLabel(std.heap.page_allocator, "BOOT", "BOOT-INTEL");
 
     // rollback it to the default value after the copy is done
-    argv = [_][]const u8{ "fw_setenv", "zeus_install", "1" };
-    child = std.process.Child.init(
-        &argv,
-        std.heap.page_allocator
-    );
-    _ = try child.spawnAndWait();
+    try ubootEnvSet("zeus_install", "1");
+    try ubootEnvSet("label_name", "BOOT-INTEL");
 
     // Flush writes to the block device before closing.
     _ = linux.syscall1(.fsync, @as(usize, @intCast(dst_fd)));

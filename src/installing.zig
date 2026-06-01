@@ -101,9 +101,10 @@ fn parentBlockDevice(partition_path: []const u8, buf: []u8) ![]const u8 {
     return buf[0..n];
 }
 
-/// Returns how many bytes to copy: sector 0 through the end of the last
-/// defined partition (plus the GPT backup header when applicable).
-/// Falls back to the full device size on any parse error.
+
+/// Returns bytes to copy: sector 0 through the GPT backup header (or last MBR
+/// partition end). This is always much less than the full device on a sparsely
+/// used disk. Falls back to the full device size on any parse error.
 fn diskCopyLimit(fd: i32, device_bytes: u64) u64 {
     return partitionedSize(fd) catch device_bytes;
 }
@@ -115,7 +116,6 @@ fn partitionedSize(fd: i32) !u64 {
     if (mbr[510] != 0x55 or mbr[511] != 0xAA)
         return error.NoMBRSignature;
 
-    // Check for GPT protective MBR: type 0xEE in first entry, or "EFI PART" at LBA 1.
     var gpt_hdr: [512]u8 = undefined;
     if (@as(isize, @bitCast(linux.pread(fd, &gpt_hdr, 512, 512))) == 512 and
         std.mem.eql(u8, gpt_hdr[0..8], "EFI PART"))
@@ -130,7 +130,7 @@ fn mbrCopyLimit(mbr: *const [512]u8) !u64 {
     var last_lba: u64 = 0;
     for (0..4) |i| {
         const e = mbr[446 + i * 16 ..][0..16];
-        if (e[4] == 0) continue; // empty entry
+        if (e[4] == 0) continue;
         const start = std.mem.readInt(u32, e[8..12], .little);
         const count = std.mem.readInt(u32, e[12..16], .little);
         if (count == 0) continue;
@@ -142,7 +142,6 @@ fn mbrCopyLimit(mbr: *const [512]u8) !u64 {
 }
 
 fn gptCopyLimit(fd: i32, hdr: *const [512]u8) !u64 {
-    const alt_lba = std.mem.readInt(u64, hdr[32..40], .little);
     const entry_lba = std.mem.readInt(u64, hdr[72..80], .little);
     const num_entries = std.mem.readInt(u32, hdr[80..84], .little);
     const entry_size = std.mem.readInt(u32, hdr[84..88], .little);
@@ -155,19 +154,41 @@ fn gptCopyLimit(fd: i32, hdr: *const [512]u8) !u64 {
         const off = entry_lba * SECTOR_SIZE + @as(u64, i) * entry_size;
         if (@as(isize, @bitCast(linux.pread(fd, &entry, entry_size, @intCast(off)))) != @as(isize, @intCast(entry_size)))
             continue;
-        if (std.mem.allEqual(u8, entry[0..16], 0)) continue; // empty GUID = unused
+        if (std.mem.allEqual(u8, entry[0..16], 0)) continue;
         const end_lba = std.mem.readInt(u64, entry[40..48], .little);
         if (end_lba > last_lba) last_lba = end_lba;
     }
     if (last_lba == 0) return error.NoPartitions;
-    // alt_lba is the backup GPT header; must be included for a bootable copy.
-    const final_lba = @max(last_lba, alt_lba);
-    return (final_lba + 1) * SECTOR_SIZE;
+    return (last_lba + 1) * SECTOR_SIZE;
+}
+
+/// Reads the AlternateLBA field from the primary GPT header so the caller can
+/// pread/pwrite the backup GPT tail (backup entries + backup header) separately,
+/// without streaming through gigabytes of unused disk space.
+fn gptAlternateLba(fd: i32) ?u64 {
+    var hdr: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &hdr, 512, 512))) != 512) return null;
+    if (!std.mem.eql(u8, hdr[0..8], "EFI PART")) return null;
+    const alt = std.mem.readInt(u64, hdr[32..40], .little);
+    return if (alt == 0) null else alt;
+}
+
+fn replaceFstabLabel(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+    const fstab = try std.fs.cwd().readFileAlloc(allocator, "/etc/fstab", 65536);
+    defer allocator.free(fstab);
+    const new_fstab = try std.mem.replaceOwned(u8, allocator, fstab, from, to);
+    defer allocator.free(new_fstab);
+    const f = try std.fs.cwd().createFile("/etc/fstab", .{});
+    defer f.close();
+    try f.writeAll(new_fstab);
 }
 
 pub fn runInstall(state: *State, complete: *std.atomic.Value(bool)) void {
     defer complete.store(true, .release);
-    doInstall(state) catch {};
+    doInstall(state) catch |err| {
+        std.log.err("install failed: {}", .{err});
+        return;
+    };
     state.progress.store(1000, .release);
 }
 
@@ -195,11 +216,29 @@ fn doInstall(state: *State) !void {
 
     var total_bytes: u64 = 0;
     _ = linux.ioctl(src_fd, BLKGETSIZE64, @intFromPtr(&total_bytes));
+    if (total_bytes == 0) return error.GetSizeFailed;
 
+    var dst_bytes: u64 = 0;
+    _ = linux.ioctl(dst_fd, BLKGETSIZE64, @intFromPtr(&dst_bytes));
     const copy_limit = diskCopyLimit(src_fd, total_bytes);
+    const alt_lba = gptAlternateLba(src_fd);
+    const backup_end = if (alt_lba) |lba| (lba + 1) * SECTOR_SIZE else copy_limit;
+    const required = @max(copy_limit, backup_end);
+
+    if (dst_bytes < required) return error.DestinationTooSmall;
 
     const buf = try std.heap.page_allocator.alloc(u8, CHUNK_SIZE);
     defer std.heap.page_allocator.free(buf);
+
+    // the copy need to be done with the zeus_install flag set to 0
+    var argv = [_][]const u8{ "fw_setenv", "zeus_install", "0" };
+    var child = std.process.Child.init(
+        &argv,
+        std.heap.page_allocator
+    );
+    _ = try child.spawnAndWait();
+
+    try replaceFstabLabel(std.heap.page_allocator, "BOOT-INTEL", "BOOT");
 
     var bytes_done: u64 = 0;
     while (bytes_done < copy_limit) {
@@ -221,10 +260,36 @@ fn doInstall(state: *State) !void {
         state.progress.store(millis, .release);
     }
 
-    // if we reach here, the copy succeeded
-    // use the system command to run fw_setenv zeus_install 0
-    var argv = [_][]const u8{ "fw_setenv", "zeus_install", "0" };
-    var child = std.process.Child.init(
+    // Copy the GPT backup tail (backup entries array + backup header) which sits
+    // near the physical end of the source disk, past the unused space we skipped.
+    // Without this the destination disk has no backup GPT and some firmware
+    // implementations refuse to recognize it or log validation errors on boot.
+    if (alt_lba) |lba| {
+        var gpt_hdr: [512]u8 = undefined;
+        const alt_off: i64 = @intCast(lba * SECTOR_SIZE);
+        if (@as(isize, @bitCast(linux.pread(src_fd, &gpt_hdr, 512, alt_off))) == 512 and
+            std.mem.eql(u8, gpt_hdr[0..8], "EFI PART"))
+        {
+            const num_entries = std.mem.readInt(u32, gpt_hdr[80..84], .little);
+            const entry_size = std.mem.readInt(u32, gpt_hdr[84..88], .little);
+            if (entry_size >= 128 and entry_size <= 512) {
+                const entries_bytes = @as(u64, num_entries) * entry_size;
+                const tail_start = lba * SECTOR_SIZE - entries_bytes;
+                const tail_len = entries_bytes + SECTOR_SIZE; // entries + header
+                const tail_buf = try std.heap.page_allocator.alloc(u8, tail_len);
+                defer std.heap.page_allocator.free(tail_buf);
+                if (@as(isize, @bitCast(linux.pread(src_fd, tail_buf.ptr, tail_len, @intCast(tail_start)))) == @as(isize, @intCast(tail_len))) {
+                    _ = linux.pwrite(dst_fd, tail_buf.ptr, tail_len, @intCast(tail_start));
+                }
+            }
+        }
+    }
+
+    try replaceFstabLabel(std.heap.page_allocator, "BOOT", "BOOT-INTEL");
+
+    // rollback it to the default value after the copy is done
+    argv = [_][]const u8{ "fw_setenv", "zeus_install", "1" };
+    child = std.process.Child.init(
         &argv,
         std.heap.page_allocator
     );

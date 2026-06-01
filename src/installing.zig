@@ -173,6 +173,109 @@ fn gptAlternateLba(fd: i32) ?u64 {
     return if (alt == 0) null else alt;
 }
 
+// EFI System Partition type GUID in its on-disk byte order.
+const EFI_PART_TYPE: [16]u8 = .{
+    0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+    0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
+};
+
+/// Returns the byte offset of the FAT/EFI boot partition, trying GPT first
+/// then falling back to MBR (type 0x0B/0x0C).
+fn findFatPartStart(fd: i32) !u64 {
+    var sec0: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &sec0, 512, 0))) != 512) return error.ReadFailed;
+    if (sec0[510] != 0x55 or sec0[511] != 0xAA) return error.NoDiskSignature;
+
+    // GPT: protective MBR at sector 0, real header at sector 1.
+    var hdr: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &hdr, 512, 512))) == 512 and
+        std.mem.eql(u8, hdr[0..8], "EFI PART"))
+    {
+        const entry_lba = std.mem.readInt(u64, hdr[72..80], .little);
+        const num_entries = std.mem.readInt(u32, hdr[80..84], .little);
+        const entry_size = std.mem.readInt(u32, hdr[84..88], .little);
+        if (entry_size >= 128 and entry_size <= 512) {
+            for (0..@min(num_entries, 128)) |i| {
+                var entry: [512]u8 = undefined;
+                const off: i64 = @intCast(entry_lba * SECTOR_SIZE + @as(u64, i) * entry_size);
+                if (@as(isize, @bitCast(linux.pread(fd, &entry, entry_size, off))) != @as(isize, @intCast(entry_size))) continue;
+                if (std.mem.eql(u8, entry[0..16], &EFI_PART_TYPE))
+                    return std.mem.readInt(u64, entry[32..40], .little) * SECTOR_SIZE;
+            }
+        }
+        return error.EfiPartNotFound;
+    }
+
+    // MBR: scan the four primary entries for a FAT32 partition (0x0B or 0x0C).
+    for (0..4) |i| {
+        const e = sec0[446 + i * 16 ..][0..16];
+        if (e[4] != 0x0B and e[4] != 0x0C) continue;
+        const start_lba = std.mem.readInt(u32, e[8..12], .little);
+        if (start_lba == 0) continue;
+        return @as(u64, start_lba) * SECTOR_SIZE;
+    }
+    return error.FatPartNotFound;
+}
+
+/// Writes `new_label` into the FAT32 volume-label fields at byte offset
+/// `part_start` within the already-open disk fd:
+///   - boot sector offset 71 (BS_VolLab)
+///   - backup boot sector (BPB_BkBootSec)
+///   - the 0x08-attribute directory entry in the root cluster
+fn setFatLabel(fd: i32, part_start: u64, new_label: []const u8) !void {
+    var boot: [512]u8 = undefined;
+    if (@as(isize, @bitCast(linux.pread(fd, &boot, 512, @intCast(part_start)))) != 512)
+        return error.ReadFailed;
+
+    // Build space-padded, uppercased 11-byte label.
+    var lab: [11]u8 = .{' '} ** 11;
+    const n = @min(new_label.len, 11);
+    @memcpy(lab[0..n], new_label[0..n]);
+    for (&lab) |*c| if (c.* >= 'a' and c.* <= 'z') { c.* -= 32; };
+
+    @memcpy(boot[71..82], &lab);
+    if (@as(isize, @bitCast(linux.pwrite(fd, &boot, 512, @intCast(part_start)))) != 512)
+        return error.WriteFailed;
+
+    // Mirror to the backup boot sector.
+    const bk = std.mem.readInt(u16, boot[50..52], .little);
+    if (bk != 0 and bk != 0xFFFF) {
+        const bk_off: i64 = @intCast(part_start + @as(u64, bk) * 512);
+        var bk_sec: [512]u8 = undefined;
+        if (@as(isize, @bitCast(linux.pread(fd, &bk_sec, 512, bk_off))) == 512) {
+            @memcpy(bk_sec[71..82], &lab);
+            _ = linux.pwrite(fd, &bk_sec, 512, bk_off);
+        }
+    }
+
+    // Update the volume-label directory entry (attr 0x08) in the root cluster.
+    const bps = std.mem.readInt(u16, boot[11..13], .little);
+    const spc: u64 = boot[13];
+    const rsvd: u64 = std.mem.readInt(u16, boot[14..16], .little);
+    const nfats: u64 = boot[16];
+    const fat_sz: u64 = std.mem.readInt(u32, boot[36..40], .little);
+    const root_clus: u64 = std.mem.readInt(u32, boot[44..48], .little);
+    if (bps == 0 or spc == 0 or root_clus < 2) return;
+    const clus_bytes = spc * @as(u64, bps);
+    const root_off: i64 = @intCast(part_start + (rsvd + nfats * fat_sz + (root_clus - 2) * spc) * @as(u64, bps));
+
+    const root_buf = try std.heap.page_allocator.alloc(u8, clus_bytes);
+    defer std.heap.page_allocator.free(root_buf);
+    if (@as(isize, @bitCast(linux.pread(fd, root_buf.ptr, clus_bytes, root_off))) != @as(isize, @intCast(clus_bytes)))
+        return;
+
+    var i: usize = 0;
+    while (i + 32 <= root_buf.len) : (i += 32) {
+        if (root_buf[i] == 0x00) break;
+        if (root_buf[i] == 0xE5) continue;
+        if (root_buf[i + 11] == 0x08) {
+            @memcpy(root_buf[i..][0..11], &lab);
+            _ = linux.pwrite(fd, root_buf.ptr, clus_bytes, root_off);
+            break;
+        }
+    }
+}
+
 fn replaceFstabLabel(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
     const fstab = try std.fs.cwd().readFileAlloc(allocator, "/etc/fstab", 65536);
     defer allocator.free(fstab);
@@ -209,7 +312,7 @@ fn doInstall(state: *State) !void {
     const src_fd: i32 = @intCast(src_fd_rc);
     defer _ = linux.close(src_fd);
 
-    const dst_fd_rc = linux.open(dst_path, .{ .ACCMODE = .WRONLY }, 0);
+    const dst_fd_rc = linux.open(dst_path, .{ .ACCMODE = .RDWR }, 0);
     if (@as(isize, @bitCast(dst_fd_rc)) < 0) return error.OpenDstFailed;
     const dst_fd: i32 = @intCast(dst_fd_rc);
     defer _ = linux.close(dst_fd);
@@ -226,6 +329,9 @@ fn doInstall(state: *State) !void {
     const required = @max(copy_limit, backup_end);
 
     if (dst_bytes < required) return error.DestinationTooSmall;
+
+    // Find the EFI/boot partition start on the source disk before cloning.
+    const boot_part_start = try findFatPartStart(src_fd);
 
     const buf = try std.heap.page_allocator.alloc(u8, CHUNK_SIZE);
     defer std.heap.page_allocator.free(buf);
@@ -284,6 +390,10 @@ fn doInstall(state: *State) !void {
             }
         }
     }
+
+    // Rename the BOOT-INTEL label on the destination BOOT partition to BOOT so
+    // it matches the fstab entry we already wrote into the clone.
+    try setFatLabel(dst_fd, boot_part_start, "BOOT");
 
     try replaceFstabLabel(std.heap.page_allocator, "BOOT", "BOOT-INTEL");
 

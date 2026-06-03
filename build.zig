@@ -6,19 +6,20 @@ pub fn build(b: *std.Build) void {
             .cpu_model = .baseline,
         },
     });
-    const optimize = b.standardOptimizeOption(.{});
+    // const optimize = b.standardOptimizeOption(.{});
 
     const tui_dep = b.dependency("tui", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
 
     const exe = b.addExecutable(.{
         .name = "zeus_intel",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .imports = &.{
                 .{ .name = "tui", .module = tui_dep.module("tui") },
             },

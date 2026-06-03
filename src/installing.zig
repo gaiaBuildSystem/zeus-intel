@@ -295,6 +295,49 @@ pub fn runInstall(state: *State, complete: *std.atomic.Value(bool)) void {
     state.progress.store(1000, .release);
 }
 
+fn changeBootFileLabelName(fromLabel: []const u8, toLabel: []const u8) !void {
+    // check if the /var/rootdirs/media/grub/<fromLabel> file exists
+    // if it exists we are on PhobOS
+    // if not we need to check /boot/<fromLabel> which is used on plain Debian
+    // with this done we then rename the <fromLabel> to <toLabel>
+    // this is a file, with a name so u-boot can check the label easily
+
+    var from_buf: [256]u8 = undefined;
+    var to_buf: [256]u8 = undefined;
+
+    const phobos_from = try std.fmt.bufPrintZ(
+        &from_buf,
+        "/var/rootdirs/media/grub/{s}",
+        .{fromLabel}
+    );
+
+    const phobos_to = try std.fmt.bufPrintZ(
+        &to_buf,
+        "/var/rootdirs/media/grub/{s}",
+        .{toLabel}
+    );
+
+    if (std.fs.cwd().access(phobos_from, .{})) |_| {
+        if (std.fs.cwd().access(phobos_to, .{})) |_| {} else |_| {
+            try std.fs.cwd().rename(phobos_from, phobos_to);
+        }
+    } else |_| {
+        const debian_from = try std.fmt.bufPrintZ(
+            &from_buf,
+            "/boot/{s}",
+            .{fromLabel}
+        );
+        const debian_to = try std.fmt.bufPrintZ(
+            &to_buf,
+            "/boot/{s}",
+            .{toLabel}
+        );
+        if (std.fs.cwd().access(debian_to, .{})) |_| {} else |_| {
+            try std.fs.cwd().rename(debian_from, debian_to);
+        }
+    }
+}
+
 fn ubootEnvSet(name: []const u8, value: []const u8) !void {
     var argv = [_][]const u8{ "fw_setenv", name, value };
     var child = std.process.Child.init(
@@ -351,6 +394,8 @@ fn doInstall(state: *State) !void {
 
     try replaceFstabLabel(std.heap.page_allocator, "BOOT-INTEL", "BOOT");
 
+    try changeBootFileLabelName("BOOT-INTEL", "BOOT");
+
     var bytes_done: u64 = 0;
     while (bytes_done < copy_limit) {
         const remaining = copy_limit - bytes_done;
@@ -405,6 +450,8 @@ fn doInstall(state: *State) !void {
     // rollback it to the default value after the copy is done
     try ubootEnvSet("zeus_install", "1");
     try ubootEnvSet("label_name", "BOOT-INTEL");
+
+    try changeBootFileLabelName("BOOT", "BOOT-INTEL");
 
     // Flush writes to the block device before closing.
     _ = linux.syscall1(.fsync, @as(usize, @intCast(dst_fd)));

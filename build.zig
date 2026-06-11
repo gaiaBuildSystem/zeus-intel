@@ -8,11 +8,6 @@ pub fn build(b: *std.Build) void {
     });
     // const optimize = b.standardOptimizeOption(.{});
 
-    const tui_dep = b.dependency("tui", .{
-        .target = target,
-        .optimize = .Debug,
-    });
-
     const exe = b.addExecutable(.{
         .name = "zeus_intel",
         .use_llvm = true,
@@ -20,9 +15,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = .Debug,
-            .imports = &.{
-                .{ .name = "tui", .module = tui_dep.module("tui") },
-            },
         }),
     });
 

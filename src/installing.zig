@@ -1,39 +1,15 @@
 const std = @import("std");
-const tui = @import("tui");
 const linux = std.os.linux;
-const State = @import("state.zig").State;
 
 // _IOR(0x12, 114, u64) on x86 Linux
 const BLKGETSIZE64: u32 = 0x80081272;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const SECTOR_SIZE: u64 = 512;
 
-pub fn handleEvent(_: *State, _: tui.Event) tui.EventResult {
-    return .ignored;
-}
-
-pub fn render(state: *const State, ctx: *tui.RenderContext) void {
-    const card_w: u16 = 60;
-    const card_h: u16 = 10;
-    const card_x = ctx.bounds.x + (ctx.bounds.width -| card_w) / 2;
-    const card_y = ctx.bounds.y + (ctx.bounds.height -| card_h) / 2;
-
-    var c = tui.Card.init("Please wait...")
-        .withTitle("Installing Phobos")
-        .withBorder(.rounded);
-
-    var card_ctx = ctx.child(
-        tui.Rect.init(card_x, card_y, card_w, card_h),
-    );
-    c.render(&card_ctx);
-
-    const p: f32 = @as(f32, @floatFromInt(state.progress.load(.acquire))) / 1000.0;
-    var bar = tui.ProgressBar.initWithProgress(p);
-    var bar_ctx = ctx.child(
-        tui.Rect.init(card_x + 2, card_y + 6, card_w - 4, 1),
-    );
-    bar.render(&bar_ctx);
-}
+pub const ProgressSink = struct {
+    ctx: *anyopaque,
+    onProgress: *const fn (ctx: *anyopaque, milli: u32) anyerror!void,
+};
 
 /// Returns the bare name (e.g. "sda") of the disk the installer booted from.
 /// Caller provides a stack buffer; returned slice points into it.
@@ -286,15 +262,6 @@ fn replaceFstabLabel(allocator: std.mem.Allocator, from: []const u8, to: []const
     try f.writeAll(new_fstab);
 }
 
-pub fn runInstall(state: *State, complete: *std.atomic.Value(bool)) void {
-    defer complete.store(true, .release);
-    doInstall(state) catch |err| {
-        std.log.err("install failed: {}", .{err});
-        return;
-    };
-    state.progress.store(1000, .release);
-}
-
 fn changeBootFileLabelName(fromLabel: []const u8, toLabel: []const u8) !void {
     // check if the /var/rootdirs/media/grub/<fromLabel> file exists
     // if it exists we are on PhobOS
@@ -347,17 +314,21 @@ fn ubootEnvSet(name: []const u8, value: []const u8) !void {
     _ = try child.spawnAndWait();
 }
 
-fn doInstall(state: *State) !void {
+pub fn installToDevice(
+    chosen_device: []const u8,
+    progress: ?*std.atomic.Value(u32),
+    sink: ?ProgressSink,
+) !void {
     var parent_buf: [64]u8 = undefined;
     const src_name = try sourceDisk(&parent_buf);
 
-    if (std.mem.eql(u8, src_name, state.chosen_device)) return error.SameDevice;
+    if (std.mem.eql(u8, src_name, chosen_device)) return error.SameDevice;
 
     var src_path_buf: [72]u8 = undefined;
     const src_path = try std.fmt.bufPrintZ(&src_path_buf, "/dev/{s}", .{src_name});
 
     var dst_path_buf: [72]u8 = undefined;
-    const dst_path = try std.fmt.bufPrintZ(&dst_path_buf, "/dev/{s}", .{state.chosen_device});
+    const dst_path = try std.fmt.bufPrintZ(&dst_path_buf, "/dev/{s}", .{chosen_device});
 
     const src_fd_rc = linux.open(src_path, .{ .ACCMODE = .RDONLY }, 0);
     if (@as(isize, @bitCast(src_fd_rc)) < 0) return error.OpenSrcFailed;
@@ -413,7 +384,8 @@ fn doInstall(state: *State) !void {
 
         bytes_done += nread;
         const millis: u32 = @intCast(@min(999, bytes_done * 1000 / copy_limit));
-        state.progress.store(millis, .release);
+        if (progress) |p| p.store(millis, .release);
+        if (sink) |s| try s.onProgress(s.ctx, millis);
     }
 
     // Copy the GPT backup tail (backup entries array + backup header) which sits

@@ -31,13 +31,7 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{
-        .tui = .{
-            // .path = "../../../../tmp/tui.zig",
-            .url = "git+https://github.com/gaiaBuildSystem/tui.zig.git#cf10f6f7ec82999b5b38f3f1c4fdb4f319781df9",
-            .hash = "tui-0.0.1-TMwxp8dWBgCcP_pfoHV0hNzPVLR-qiYA9N73gtI3xhTz",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

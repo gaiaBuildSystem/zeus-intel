@@ -161,12 +161,12 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, argv);
 
     const opts = parseArgs(argv) catch |err| {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        try stderr.writeAll("{\"ok\":false,\"code\":\"ArgumentError\",\"message\":");
+        const out = std.fs.File.stdout().deprecatedWriter();
+        try out.writeAll("{\"ok\":false,\"code\":\"ArgumentError\",\"message\":");
         const msg = try std.fmt.allocPrint(allocator, "{}", .{err});
         defer allocator.free(msg);
-        try writeJsonString(stderr, msg);
-        try stderr.writeAll("}\n");
+        try writeJsonString(out, msg);
+        try out.writeAll("}\n");
         std.process.exit(2);
     };
 
@@ -175,7 +175,6 @@ pub fn main() !void {
 
     const stdout_file = std.fs.File.stdout();
     const out = stdout_file.deprecatedWriter();
-    const errw = std.fs.File.stderr().deprecatedWriter();
 
     if (opts.help) {
         try writeHelpJson(out);
@@ -195,22 +194,22 @@ pub fn main() !void {
     }
 
     const target = opts.target orelse {
-        try writeErrorJson(errw, "MissingDevice", "missing target device, use --device <name> or positional <name>");
+        try writeErrorJson(out, "MissingDevice", "missing target device, use --device <name> or positional <name>");
         std.process.exit(2);
     };
 
     if (!isValidTargetName(target)) {
-        try writeErrorJson(errw, "InvalidDeviceName", "invalid device name");
+        try writeErrorJson(out, "InvalidDeviceName", "invalid device name");
         std.process.exit(2);
     }
 
     if (!containsDevice(devices.items, target)) {
-        try writeErrorJson(errw, "InvalidTarget", "target is not in valid block device list");
+        try writeErrorJson(out, "InvalidTarget", "target is not in valid block device list");
         std.process.exit(2);
     }
 
     if (!(try installing.kernelCmdlineHasZeusInstall1())) {
-        try writeErrorJson(errw, "InstallBlockedByKernelCmdline", "install blocked: kernel cmdline must contain zeus_install=1");
+        try writeErrorJson(out, "InstallBlockedByKernelCmdline", "install blocked: kernel cmdline must contain zeus_install=1");
         std.process.exit(2);
     }
 
@@ -234,7 +233,7 @@ pub fn main() !void {
     }) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "install failed: {}", .{err});
         defer allocator.free(msg);
-        try writeErrorJson(errw, "InstallFailed", msg);
+        try writeErrorJson(out, "InstallFailed", msg);
         std.process.exit(1);
     };
     try out.writeAll("{\"ok\":true,\"action\":\"flash\",\"status\":\"done\",\"device\":");

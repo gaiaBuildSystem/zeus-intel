@@ -209,6 +209,11 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
+    if (!(try installing.kernelCmdlineHasZeusInstall1())) {
+        try writeErrorJson(errw, "InstallBlockedByKernelCmdline", "install blocked: kernel cmdline must contain zeus_install=1");
+        std.process.exit(2);
+    }
+
     if (!opts.assume_yes) {
         const stdin = std.fs.File.stdin().deprecatedReader();
         const confirmed = try askConfirmation(stdin, out, target);

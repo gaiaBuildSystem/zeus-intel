@@ -314,11 +314,28 @@ fn ubootEnvSet(name: []const u8, value: []const u8) !void {
     _ = try child.spawnAndWait();
 }
 
+pub fn kernelCmdlineHasZeusInstall1() !bool {
+    const cmdline = try std.fs.cwd().readFileAlloc(
+        std.heap.page_allocator,
+        "/proc/cmdline",
+        8192,
+    );
+    defer std.heap.page_allocator.free(cmdline);
+
+    var it = std.mem.tokenizeAny(u8, cmdline, " \t\r\n\x00");
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "zeus_install=1")) return true;
+    }
+    return false;
+}
+
 pub fn installToDevice(
     chosen_device: []const u8,
     progress: ?*std.atomic.Value(u32),
     sink: ?ProgressSink,
 ) !void {
+    if (!(try kernelCmdlineHasZeusInstall1())) return error.InstallBlockedByKernelCmdline;
+
     var parent_buf: [64]u8 = undefined;
     const src_name = try sourceDisk(&parent_buf);
 
